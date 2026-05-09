@@ -4,11 +4,17 @@ A cross-project persistent knowledge base for Claude Code. Stores solutions, pat
 
 ## Features
 
-- **Semantic search** — Finds entries by meaning, not just keywords. Uses `paraphrase-multilingual-MiniLM-L12-v2` for multilingual embeddings with hybrid ranking (vector similarity + keyword match).
+- **Semantic search** — Finds entries by meaning, not just keywords. Uses `paraphrase-multilingual-MiniLM-L12-v2` for multilingual embeddings with hybrid ranking (vector similarity + keyword match). Search results automatically update reference counts.
 - **LLM-assisted conflict judgment** — Vector screening finds candidate matches, then Claude (the LLM) judges whether they are real contradictions — no hardcoded word lists.
+- **Auto-capture** — `knowledge_capture` auto-generates name, type, tags, and description from raw text. Vector-screens against existing entries. Use at session end or after fixing bugs to avoid losing experiences.
+- **Crystallize** — `knowledge_crystallize` extracts structured knowledge from conversation context into a draft entry ready for `knowledge_add` review.
+- **Health check** — `knowledge_health` runs structural integrity checks (index sync, empty entries, cache staleness, stale entries). Zero LLM calls — safe to run every session.
+- **Lint** — `knowledge_lint` reports content-quality issues: stale entries, merge candidates, missing tags, short content.
 - **Date-grouped storage** — Entries are stored as markdown files grouped by date (`~/.claude/knowledge/entries/YYYY-MM-DD.md`), human-readable and version-control friendly.
-- **MCP integration** — Exposes 7 MCP tools for use within Claude Code: `knowledge_search`, `knowledge_add`, `knowledge_confirm`, `knowledge_list`, `knowledge_check`, `knowledge_stats`, `knowledge_show`.
+- **MCP integration** — Exposes 11 MCP tools for use within Claude Code: `knowledge_search`, `knowledge_add`, `knowledge_confirm`, `knowledge_list`, `knowledge_check`, `knowledge_health`, `knowledge_capture`, `knowledge_crystallize`, `knowledge_lint`, `knowledge_stats`, `knowledge_show`.
 - **Dual-path import** — Explicit path (user says "remember this") and implicit path (AI auto-detects → buffers to temp → user confirms).
+- **Reference tracking** — Each entry tracks `reference_count` and `last_referenced`. Stale entries are flagged by health/lint.
+- **Operation log** — Append-only `log.jsonl` records every add/search/confirm/discard operation for auditability.
 - **Embedding cache** — Caches computed embeddings to disk, only recomputes when the index changes.
 
 ## How It Works
@@ -72,6 +78,12 @@ A cross-project persistent knowledge base for Claude Code. Stores solutions, pat
 │  │         │                                 │    │
 │  │         ▼ (Claude judges)                 │    │
 │  │  knowledge_confirm(pending_id, "write")   │    │
+│  │                                          │    │
+│  │  knowledge_search ──→ bump ref_count     │    │
+│  │  knowledge_health ──→ zero LLM            │    │
+│  │  knowledge_capture ──→ auto-metadata     │    │
+│  │  knowledge_crystallize ──→ draft         │    │
+│  │  knowledge_lint ──→ quality report       │    │
 │  └──────────────┬───────────────────────────┘    │
 │                 │                                 │
 └─────────────────┼─────────────────────────────────┘
@@ -91,10 +103,16 @@ A cross-project persistent knowledge base for Claude Code. Stores solutions, pat
 │  │   - Labels candidates      │  │
 │  │   - LLM does final judge   │  │
 │  ├────────────────────────────┤  │
+│  │  Health Checker            │  │
+│  │   - Index integrity        │  │
+│  │   - Empty/stale entries    │  │
+│  │   - Cache staleness        │  │
+│  ├────────────────────────────┤  │
 │  │  Storage                   │  │
 │  │   ~/.claude/knowledge/     │  │
 │  │   ├── entries/             │  │
 │  │   ├── INDEX.json           │  │
+│  │   ├── log.jsonl            │  │
 │  │   └── .embedding_cache     │  │
 │  └────────────────────────────┘  │
 └──────────────────────────────────┘
@@ -170,6 +188,7 @@ Stage a new entry. Performs vector screening; if similar entries exist, returns 
 | `tags` | string | `""` | Comma-separated tags |
 | `entry_type` | string | `"reference"` | `"environment"`, `"bugfix"`, `"pattern"`, `"reference"`, `"tip"` |
 | `description` | string | `""` | Short description |
+| `source` | string | `"conversation"` | Source label (e.g. `"auto-capture"`, `"conversation"`) |
 | `force` | bool | `false` | Skip screening — write directly |
 
 ### `knowledge_confirm`
@@ -209,6 +228,40 @@ Display the full content of a specific entry.
 |-----------|------|---------|-------------|
 | `name` | string | (required) | Entry name as shown in `knowledge_list` |
 
+### `knowledge_health`
+
+Run structural integrity checks. Zero LLM calls — safe to run every session.
+
+No parameters.
+
+Checks: index integrity, empty entries, cache staleness, stale entries (>90 days without reference).
+
+### `knowledge_capture`
+
+Auto-capture a potential entry from raw text. Auto-generates name, type, tags, and description. Vector-screens and either writes directly (if clean) or returns `PENDING_ID` with candidates.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `raw_text` | string | (required) | Raw experience text (error message, fix, pattern, etc.) |
+| `source` | string | `"auto-capture"` | Source label |
+| `context_hint` | string | `""` | One-line hint to help generate better name/tags |
+
+### `knowledge_crystallize`
+
+Extract structured knowledge from conversation context. Returns a draft entry ready for review and `knowledge_add`. Does NOT save — the LLM reviews and forwards to `knowledge_add`.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `conversation_text` | string | (required) | Conversation excerpt to crystallize |
+| `hint_name` | string | `""` | Suggested entry name |
+| `hint_type` | string | `""` | Suggested type (from VALID_TYPES) |
+
+### `knowledge_lint`
+
+Content-quality audit. Reports stale entries, merge candidates (similar pairs), missing tags, and short content.
+
+No parameters.
+
 ## Two-Step Entry Flow
 
 When `knowledge_add` is called, one of two paths is taken:
@@ -236,6 +289,21 @@ knowledge_add(name, content, tags)
 ```
 
 This delegates semantic judgment to the LLM — no hardcoded word lists, no false positives from surface-level pattern matching.
+
+## Health / Lint Workflow
+
+Borrowing from llm-wiki-agent's design:
+
+| | Health (`knowledge_health`) | Lint (`knowledge_lint`) |
+|---|---|---|
+| Scope | Structural integrity | Content quality |
+| LLM calls | Zero | Yes (semantic analysis) |
+| Cost | Free | Tokens |
+| Frequency | Every session | Every 10-15 adds |
+| Checks | Index sync, empty entries, cache staleness, stale refs | Stale entries, merge candidates, missing tags, short content |
+| Tool | `knowledge_base.py health` | `knowledge_lint` MCP tool |
+
+Run `knowledge_health` first — linting a corrupt index wastes tokens.
 
 ## Dual-Path Import
 
@@ -314,8 +382,9 @@ All data is stored locally under `~/.claude/knowledge/`:
 ```
 
 - **entries/** — Human-readable markdown, one file per date, one `## section` per entry
-- **INDEX.json** — Entry metadata index (names, tags, types, timestamps)
+- **INDEX.json** — Entry metadata index (names, tags, types, timestamps, reference counts)
 - **.embedding_cache.pkl** — Pickled embedding vectors, invalidated when index changes
+- **log.jsonl** — Append-only operation log (add, search, confirm, discard)
 
 ## CLI Usage
 
@@ -335,7 +404,10 @@ python knowledge_base.py list --tag windows
 # Audit for duplicates and conflicts
 python knowledge_base.py check
 
-# Statistics
+# Structural health check (zero LLM)
+python knowledge_base.py health
+
+# Statistics (with reference tracking)
 python knowledge_base.py stats
 
 # Show full entry

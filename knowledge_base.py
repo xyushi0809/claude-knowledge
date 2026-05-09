@@ -9,6 +9,7 @@ Usage:
     python knowledge_base.py add <name> --tags t1,t2 --type t < content.md
     python knowledge_base.py search <query> [--top 5] [--mode hybrid]
     python knowledge_base.py check [--fix]
+    python knowledge_base.py health
     python knowledge_base.py list [--tag t]
     python knowledge_base.py stats
     python knowledge_base.py show <name>
@@ -39,6 +40,7 @@ KNOWLEDGE_DIR = Path.home() / ".claude" / "knowledge"
 ENTRIES_DIR = KNOWLEDGE_DIR / "entries"
 INDEX_FILE = KNOWLEDGE_DIR / "INDEX.json"
 EMBEDDING_CACHE = KNOWLEDGE_DIR / ".embedding_cache.pkl"
+LOG_FILE = KNOWLEDGE_DIR / "log.jsonl"
 
 VALID_TYPES = {"environment", "bugfix", "pattern", "reference", "tip"}
 DUP_THRESHOLD = 0.85       # similarity above this = duplicate
@@ -197,19 +199,24 @@ def save_index(index: dict):
 
 
 def rebuild_index(entries: list[dict]) -> dict:
-    """Rebuild INDEX.json from parsed entries."""
+    """Rebuild INDEX.json from parsed entries. Preserves existing reference tracking."""
+    old_index = load_index()
+    old_entries = old_index.get("entries", {})
     index = {"version": 1, "entries": {}}
     for e in entries:
         name = e["name"]
+        old = old_entries.get(name, {})
         index["entries"][name] = {
             "name": name,
             "description": e.get("description", ""),
             "type": e.get("type", "reference"),
             "tags": e.get("tags", []),
             "source": e.get("source", ""),
-            "created": _date_from_path(e.get("file_path", "")),
+            "created": old.get("created") or e.get("created") or _date_from_path(e.get("file_path", "")),
             "updated": _date_from_path(e.get("file_path", "")),
-            "conflicts": [],
+            "last_referenced": old.get("last_referenced", ""),
+            "reference_count": old.get("reference_count", 0),
+            "conflicts": old.get("conflicts", []),
         }
     save_index(index)
     return index
@@ -218,6 +225,38 @@ def rebuild_index(entries: list[dict]) -> dict:
 def _date_from_path(path: str) -> str:
     m = re.search(r"(\d{4}-\d{2}-\d{2})", path)
     return m.group(1) if m else ""
+
+
+def _log_operation(op: str, entry_name: str = "", detail: str = ""):
+    """Append an operation record to log.jsonl."""
+    record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "operation": op,
+        "entry": entry_name,
+        "detail": detail[:500] if detail else "",
+    }
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _bump_reference(names: list[str]):
+    """Increment reference_count and update last_referenced for listed entries."""
+    if not names:
+        return
+    index = load_index()
+    entries = index.get("entries", {})
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    changed = False
+    for name in names:
+        if name in entries:
+            entries[name]["last_referenced"] = now
+            entries[name]["reference_count"] = entries[name].get("reference_count", 0) + 1
+            changed = True
+    if changed:
+        save_index(index)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +500,8 @@ def cmd_search(args):
         print("No matching results found.")
         return
 
+    _bump_reference([r["name"] for r in results])
+
     print(f"Found {len(results)} result(s):\n")
     for r in results:
         score = r.get("score", 0)
@@ -526,6 +567,115 @@ def cmd_check(args):
         print("Note: candidates are vector-screened only. Use the MCP tool for LLM-assisted judgment.")
 
 
+# ---------------------------------------------------------------------------
+# Health Check (zero LLM calls — safe to run every session)
+# ---------------------------------------------------------------------------
+
+def check_health() -> dict:
+    """Run structural health checks. Returns dict with issues found.
+
+    Checks:
+      - Index integrity (orphan entries in either direction)
+      - Empty entries (body is blank or whitespace)
+      - Cache staleness (embedding cache older than index)
+      - Stale entries (not referenced in >90 days)
+    """
+    issues = []
+    entries = read_all_entries()
+    entry_names = {e["name"] for e in entries}
+    index = load_index()
+    index_entries = index.get("entries", {})
+    index_names = set(index_entries.keys())
+
+    # Index ↔ files integrity
+    on_disk_only = entry_names - index_names
+    in_index_only = index_names - entry_names
+    if on_disk_only:
+        issues.append({
+            "check": "index_integrity",
+            "severity": "warning",
+            "message": f"Entries on disk but missing from INDEX.json: {', '.join(sorted(on_disk_only))}",
+            "fix": "Run rebuild: knowledge_base.py check --fix",
+        })
+    if in_index_only:
+        issues.append({
+            "check": "index_integrity",
+            "severity": "warning",
+            "message": f"Entries in INDEX.json but missing from disk: {', '.join(sorted(in_index_only))}",
+            "fix": "Rebuild index to remove stale references",
+        })
+
+    # Empty entries
+    empty = [e["name"] for e in entries if not (e.get("body") or "").strip()]
+    if empty:
+        issues.append({
+            "check": "empty_entries",
+            "severity": "info",
+            "message": f"Entries with no body content: {', '.join(empty)}",
+            "fix": "Add content or delete these entries",
+        })
+
+    # Stale entries (>90 days without reference)
+    from datetime import datetime as dt, timezone as tz, timedelta
+    cutoff = (dt.now(tz.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+    stale = []
+    for e in index_entries.values():
+        last_ref = e.get("last_referenced", "") or e.get("created", "")
+        if last_ref and last_ref < cutoff:
+            # Only flag if older than cutoff AND has no recent implicit activity
+            ref_count = e.get("reference_count", 0)
+            if ref_count < 2:  # very low engagement
+                stale.append(e["name"])
+    if stale:
+        issues.append({
+            "check": "stale_entries",
+            "severity": "info",
+            "message": f"Entries with no recent references (>90 days, low engagement): {', '.join(stale[:10])}",
+            "fix": "Review and consider archiving or updating",
+        })
+
+    # Cache staleness
+    if EMBEDDING_CACHE.exists() and INDEX_FILE.exists():
+        cache_mtime = EMBEDDING_CACHE.stat().st_mtime
+        index_mtime = INDEX_FILE.stat().st_mtime
+        if index_mtime > cache_mtime + 60:  # index newer than cache by >1 min
+            issues.append({
+                "check": "cache_staleness",
+                "severity": "info",
+                "message": "Embedding cache is older than INDEX.json — cache will be rebuilt on next search",
+                "fix": "No action needed (auto-heals with next search/add)",
+            })
+
+    return {
+        "status": "ok" if not any(i["severity"] == "error" for i in issues) else "issues_found",
+        "total_entries": len(entries),
+        "index_entries": len(index_entries),
+        "issues": issues,
+    }
+
+
+def cmd_health(args):
+    """Run structural health check."""
+    result = check_health()
+    issues = result["issues"]
+
+    print(f"=== claude-knowledge Health Check ===")
+    print(f"Entries on disk: {result['total_entries']}")
+    print(f"Entries in index: {result['index_entries']}")
+
+    if not issues:
+        print("✓ All checks passed.")
+    else:
+        print(f"\n{len(issues)} issue(s) found:\n")
+        for issue in issues:
+            sev = issue["severity"].upper()
+            print(f"  [{sev}] {issue['check']}")
+            print(f"  {issue['message']}")
+            if issue.get("fix"):
+                print(f"  → {issue['fix']}")
+            print()
+
+
 def cmd_list(args):
     """List all entries."""
     index = load_index()
@@ -561,11 +711,13 @@ def cmd_stats(args):
 
     types = {}
     all_tags = {}
+    ref_counts = []
     for e in entries.values():
         t = e.get("type", "unknown")
         types[t] = types.get(t, 0) + 1
         for tag in e.get("tags", []):
             all_tags[tag] = all_tags.get(tag, 0) + 1
+        ref_counts.append(e.get("reference_count", 0))
 
     created_dates = [e.get("created", "") for e in entries.values() if e.get("created")]
     created_dates.sort()
@@ -574,6 +726,9 @@ def cmd_stats(args):
     print(f"Total entries: {len(entries)}")
     print(f"Earliest: {created_dates[0][:10] if created_dates else 'N/A'}")
     print(f"Latest: {created_dates[-1][:10] if created_dates else 'N/A'}")
+    if ref_counts:
+        print(f"Total references: {sum(ref_counts)}")
+        print(f"Most referenced entry: {max(ref_counts)} refs")
     print(f"\nBy type:")
     for t, c in sorted(types.items(), key=lambda x: -x[1]):
         print(f"  {t}: {c}")
@@ -634,6 +789,8 @@ def main():
 
     sub.add_parser("stats", help="Show statistics")
 
+    sub.add_parser("health", help="Run structural health check")
+
     p_show = sub.add_parser("show", help="Show full entry")
     p_show.add_argument("name", help="Entry name")
 
@@ -643,6 +800,7 @@ def main():
         "add": cmd_add,
         "search": cmd_search,
         "check": cmd_check,
+        "health": cmd_health,
         "list": cmd_list,
         "stats": cmd_stats,
         "show": cmd_show,

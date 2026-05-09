@@ -46,6 +46,7 @@ def _write_entry(name, content, tag_list, entry_type, source, description):
     path = kb.append_to_date_file(meta, content)
     entries = kb.read_all_entries()
     kb.rebuild_index(entries)
+    kb._log_operation("add", entry_name=name, detail=f"type={entry_type} tags={','.join(tag_list)}")
     if entries:
         texts = [kb._content_for_search(e) for e in entries]
         embeddings = kb.compute_embeddings(texts)
@@ -94,6 +95,9 @@ def search(query: str, top_n: int = 5, mode: str = "hybrid") -> str:
 
     if not results:
         return "No matching results found."
+
+    kb._bump_reference([r["name"] for r in results])
+    kb._log_operation("search", detail=query[:200])
 
     lines = [f"Found {len(results)} result(s):\n"]
     for r in results:
@@ -241,6 +245,7 @@ def confirm_entry(pending_id: str, action: str = "write") -> str:
         return f"Error: No pending entry with id '{pending_id}'. It may have already been confirmed or expired."
 
     if action == "discard":
+        kb._log_operation("discard", entry_name=entry["name"])
         return f"Discarded: {entry['name']}"
 
     # Write the entry (conflict judgment was already done by LLM)
@@ -401,6 +406,324 @@ def show_entry(name: str) -> str:
             lines.append(e.get("body", ""))
             return "\n".join(lines)
     return f"Entry not found: {name}"
+
+
+@mcp.tool(
+    name="knowledge_health",
+    description="Run structural health checks on claude-knowledge. Zero LLM calls — safe to run every session."
+)
+def health() -> str:
+    """Run health check: index integrity, empty entries, cache staleness, stale entries."""
+    kb.ensure_dirs()
+    result = kb.check_health()
+    issues = result["issues"]
+
+    lines = ["=== claude-knowledge Health Check ===",
+             f"Entries on disk: {result['total_entries']}",
+             f"Entries in index: {result['index_entries']}"]
+
+    if not issues:
+        lines.append("✓ All checks passed.")
+    else:
+        lines.append(f"\n{len(issues)} issue(s) found:\n")
+        for issue in issues:
+            sev = issue["severity"].upper()
+            lines.append(f"  [{sev}] {issue['check']}")
+            lines.append(f"  {issue['message']}")
+            if issue.get("fix"):
+                lines.append(f"  → {issue['fix']}")
+            lines.append("")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="knowledge_capture",
+    description="Auto-capture a potential knowledge entry from raw text. "
+                "Vector-screens, auto-generates name/tags/description, "
+                "returns PENDING_ID if candidates found or writes directly if clean. "
+                "Use at session end or after fixing a bug to avoid missing experiences."
+)
+def capture(raw_text: str, source: str = "auto-capture", context_hint: str = "") -> str:
+    """Stage an auto-captured entry from raw text.
+
+    Args:
+        raw_text: The raw experience text (error message, fix, pattern, etc.)
+        source: Source label (default "auto-capture")
+        context_hint: One-line hint to help generate better name/tags
+    """
+    kb.ensure_dirs()
+
+    if not raw_text or len(raw_text.strip()) < 20:
+        return "Error: Text too short to capture (< 20 chars)."
+
+    # Auto-generate metadata
+    # Name: use context_hint if given, else first meaningful line
+    text = raw_text.strip()
+    if context_hint:
+        name = kb._sanitize_name(context_hint)
+    else:
+        first_line = text.split("\n")[0].strip()
+        name = kb._sanitize_name(first_line[:60])
+    if not name or len(name) < 3:
+        name = f"auto-{str(uuid.uuid4())[:8]}"
+
+    # Auto-detect type from keywords
+    lower_text = text.lower()
+    if any(w in lower_text for w in ("error", "bug", "fix", "failed", "solution", "修复")):
+        entry_type = "bugfix"
+    elif any(w in lower_text for w in ("setup", "install", "config", "path", "environment", "python3", "配置")):
+        entry_type = "environment"
+    elif any(w in lower_text for w in ("pattern", "approach", "workflow", "pipeline", "模式")):
+        entry_type = "pattern"
+    elif any(w in lower_text for w in ("tip", "trick", "note", "技巧")):
+        entry_type = "tip"
+    else:
+        entry_type = "reference"
+
+    # Auto-generate description
+    description = text[:120].replace("\n", " ")
+
+    # Auto-extract tags from common categories
+    tags = []
+    if "windows" in lower_text:
+        tags.append("windows")
+    if "git" in lower_text or "bash" in lower_text:
+        tags.append("git")
+    if "python" in lower_text or "pip" in lower_text:
+        tags.append("python")
+    if "mcp" in lower_text:
+        tags.append("mcp")
+    if "claude" in lower_text:
+        tags.append("claude-code")
+    if "stata" in lower_text:
+        tags.append("stata")
+
+    name = kb._sanitize_name(name)
+    if not name:
+        return "Error: Could not generate valid name."
+
+    tag_list = tags if tags else []
+    tag_str = ",".join(tag_list)
+
+    # Check for candidates
+    entries = kb.read_all_entries()
+    index = kb.load_index()
+
+    new_entry = {
+        "name": name,
+        "description": description,
+        "type": entry_type,
+        "tags": tag_list,
+        "body": text,
+    }
+
+    embeddings = None
+    if entries:
+        embeddings = kb.load_embedding_cache(index)
+        if embeddings is None:
+            texts_emb = [kb._content_for_search(e) for e in entries]
+            embeddings = kb.compute_embeddings(texts_emb)
+            kb.save_embedding_cache(embeddings, [e["name"] for e in entries], index)
+
+    if entries and embeddings is not None:
+        new_emb = kb.compute_embeddings([kb._content_for_search(new_entry)])[0]
+        candidates = kb.find_candidates(new_entry, entries, embeddings, new_emb)
+
+        if candidates:
+            duplicates = [(e, s) for e, s, k in candidates if k == "duplicate"]
+            conflicts = [(e, s) for e, s, k in candidates if k == "potential_conflict"]
+
+            pending_id = str(uuid.uuid4())[:8]
+            _pending[pending_id] = {
+                "name": name,
+                "content": text,
+                "tags": tag_str,
+                "entry_type": entry_type,
+                "source": source,
+                "description": description,
+            }
+
+            msg = [f"PENDING_ID: {pending_id}",
+                   f"Auto-captured: **{name}** (type={entry_type}, tags={tag_str or 'none'})"]
+            if duplicates:
+                msg.append(f"\n{len(duplicates)} potential duplicate(s) — similar entries already exist:")
+                for e, s in duplicates:
+                    msg.append(f"  - **{e['name']}** (similarity: {s:.3f}): {e.get('description', '')[:80]}")
+            if conflicts:
+                msg.append(f"\n{len(conflicts)} topic overlap(s) — judge if these contradict:")
+                for e, s in conflicts:
+                    msg.append(f"  - **{e['name']}** (similarity: {s:.3f}): {e.get('description', '')[:80]}")
+            msg.append(f"\n### Captured content preview")
+            msg.append(f"```\n{text[:400]}\n```")
+            msg.append(f"\nTo save: `knowledge_confirm(pending_id=\"{pending_id}\", action=\"write\")`")
+            msg.append(f"To edit name/tags first, pass to `knowledge_add` with adjusted params instead.")
+
+            return "\n".join(msg)
+
+    # No candidates — write directly
+    path = _write_entry(name, text, tag_list, entry_type, source, description)
+    return f"Auto-captured and saved: **{name}** ({path})\nType: {entry_type} | Tags: {tag_str or 'none'}"
+
+
+@mcp.tool(
+    name="knowledge_crystallize",
+    description="Extract structured knowledge from conversation context. "
+                "Takes a conversation excerpt and returns a draft entry ready "
+                "for knowledge_add. Does NOT save — returns the structured draft "
+                "for the LLM to review, adjust, and then pass to knowledge_add."
+)
+def crystallize(conversation_text: str, hint_name: str = "", hint_type: str = "") -> str:
+    """Extract a structured knowledge entry from raw conversation text.
+
+    This is a pre-processor: it formats the conversation insight into the
+    structure knowledge_add expects. The LLM should review the output,
+    adjust as needed, then call knowledge_add with the final version.
+
+    Args:
+        conversation_text: The conversation excerpt to crystallize
+        hint_name: Suggested entry name (if empty, auto-generated)
+        hint_type: Suggested type (if empty, auto-detected)
+    """
+    if not conversation_text or len(conversation_text.strip()) < 30:
+        return "Error: Conversation text too short to crystallize (< 30 chars)."
+
+    text = conversation_text.strip()
+
+    # Auto-detect type
+    if hint_type and hint_type in kb.VALID_TYPES:
+        entry_type = hint_type
+    else:
+        lower_text = text.lower()
+        if any(w in lower_text for w in ("error", "bug", "fix", "failed", "solution", "修复")):
+            entry_type = "bugfix"
+        elif any(w in lower_text for w in ("setup", "install", "config", "path", "environment", "python3", "配置")):
+            entry_type = "environment"
+        elif any(w in lower_text for w in ("pattern", "approach", "workflow", "pipeline", "模式")):
+            entry_type = "pattern"
+        elif any(w in lower_text for w in ("tip", "trick", "note", "技巧")):
+            entry_type = "tip"
+        else:
+            entry_type = "reference"
+
+    # Extract a description (first meaningful sentence under 150 chars)
+    description = text[:150].replace("\n", " ")
+
+    # Generate default name
+    name = kb._sanitize_name(hint_name) if hint_name else ""
+    if not name or len(name) < 3:
+        name = f"crystallized-{str(uuid.uuid4())[:8]}"
+
+    # Auto-suggest tags
+    lower_text = text.lower()
+    tag_suggestions = []
+    if "windows" in lower_text: tag_suggestions.append("windows")
+    if "git" in lower_text or "bash" in lower_text: tag_suggestions.append("git")
+    if "python" in lower_text or "pip" in lower_text: tag_suggestions.append("python")
+    if "mcp" in lower_text: tag_suggestions.append("mcp")
+    if "claude" in lower_text: tag_suggestions.append("claude-code")
+    if "stata" in lower_text: tag_suggestions.append("stata")
+
+    lines = [
+        "=== Crystallized Knowledge Draft ===",
+        "",
+        "Review this draft, adjust as needed, then pass to `knowledge_add`.",
+        "",
+        f"  name: {name}",
+        f"  entry_type: {entry_type}",
+        f"  tags: {','.join(tag_suggestions)}",
+        f"  description: {description[:120]}",
+        "",
+        "### Content:",
+        "```",
+        text[:2000],
+        "```",
+        "",
+        "To save: `knowledge_add(name=\"...\", content=\"...\", tags=\"...\", entry_type=\"...\")`",
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    name="knowledge_lint",
+    description="Content-quality audit of claude-knowledge. Reports stale entries, "
+                "merge candidates, missing tags, and short content. Use after "
+                "knowledge_health for a full picture."
+)
+def lint() -> str:
+    """Run content-quality linting on all entries.
+
+    Reports:
+      - Entries with no tags (harder to discover)
+      - Entries with very short content (<50 chars body)
+      - Entries with high similarity that may need merging
+      - Stale entries not referenced in >90 days
+    """
+    kb.ensure_dirs()
+    entries = kb.read_all_entries()
+    if not entries:
+        return "Knowledge base is empty."
+
+    index = kb.load_index()
+    index_entries = index.get("entries", {})
+    issues = []
+
+    # Missing tags
+    no_tags = [e["name"] for e in entries if not e.get("tags")]
+    if no_tags:
+        issues.append(f"**{len(no_tags)} entries with no tags** (harder to search):")
+        issues.append("  " + ", ".join(no_tags[:15]))
+        issues.append("  → Tip: add tags like #windows, #python, #git for better discoverability\n")
+
+    # Short content
+    short = [e["name"] for e in entries if len((e.get("body") or "").strip()) < 50]
+    if short:
+        issues.append(f"**{len(short)} entries with very short content** (<50 chars):")
+        issues.append("  " + ", ".join(short))
+        issues.append("  → Review: brief entries may need expanding\n")
+
+    # Merge candidates (high similarity pairs)
+    if len(entries) >= 2:
+        texts = [kb._content_for_search(e) for e in entries]
+        embeddings = kb.compute_embeddings(texts)
+        import numpy as np
+        embs = np.array(embeddings)
+        n = len(entries)
+        merge_candidates = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                sim = float(embs[i] @ embs[j])
+                if 0.70 <= sim < kb.DUP_THRESHOLD:  # same range as conflict candidates
+                    merge_candidates.append((entries[i]["name"], entries[j]["name"], sim))
+        if merge_candidates:
+            # Sort by similarity descending
+            merge_candidates.sort(key=lambda x: -x[2])
+            issues.append(f"**{len(merge_candidates)} merge candidate pairs** (similarity 0.70–0.85):")
+            for a, b, sim in merge_candidates[:10]:
+                issues.append(f"  - {a} ↔ {b} (similarity: {sim:.3f})")
+            issues.append("  → Review: can these be merged or one archived?\n")
+
+    # Stale entries
+    from datetime import datetime as dt, timezone as tz, timedelta
+    cutoff = (dt.now(tz.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+    stale = []
+    for e in index_entries.values():
+        last_ref = e.get("last_referenced", "") or e.get("created", "")
+        ref_count = e.get("reference_count", 0)
+        if last_ref and last_ref < cutoff and ref_count < 2:
+            stale.append((e["name"], last_ref, ref_count))
+    if stale:
+        issues.append(f"**{len(stale)} stale entries** (not referenced in >90 days, low engagement):")
+        for name, last_ref, ref_count in stale[:10]:
+            issues.append(f"  - {name} (last referenced: {last_ref}, refs: {ref_count})")
+        issues.append("  → Review: archive, update, or delete\n")
+
+    if not issues:
+        return f"✓ Lint complete: {len(entries)} entries, no issues found."
+
+    header = [f"=== claude-knowledge Lint Report ===\n",
+              f"Total entries: {len(entries)}\n",
+              f"{len(issues)} section(s) found:\n"]
+    return "\n".join(header + issues)
 
 
 # ---------------------------------------------------------------------------
