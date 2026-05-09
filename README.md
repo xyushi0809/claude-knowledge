@@ -110,7 +110,7 @@ A cross-project persistent knowledge base for Claude Code. Stores solutions, pat
 ### Step 1: Clone and install dependencies
 
 ```bash
-git clone <repo-url> claude-knowledge
+git clone https://github.com/xyushi0809/claude-knowledge.git
 cd claude-knowledge
 pip install sentence-transformers jieba numpy mcp
 ```
